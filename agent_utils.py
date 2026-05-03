@@ -1,152 +1,115 @@
 import os
-from transformers import pipeline
+import io
+import shutil
+import zipfile
+import pandas as pd
+import PyPDF2
+import docx
+import pytesseract
+from PIL import Image
+from pdf2image import convert_from_path
+import ollama
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-
-# ---------------- EMBEDDING MODEL ---------------- #
+VECTOR_PATH = 'vectorstore'
 
 embedding = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-small-en-v1.5",
-    model_kwargs={"device": "cpu"},
-    encode_kwargs={"normalize_embeddings": True}
+    model_name='sentence-transformers/all-MiniLM-L6-v2',
+    model_kwargs={'device':'cpu'},
+    encode_kwargs={'normalize_embeddings':True}
 )
 
 
-# ---------------- LLM MODEL ---------------- #
-
-generator = pipeline(
-    "text2text-generation",
-    model="google/flan-t5-base",
-    max_new_tokens=512,
-    temperature=0.2,
-    do_sample=False
-)
+def generate_text(prompt):
+    response = ollama.chat(
+        model='llama3',
+        messages=[{'role':'user','content':prompt}]
+    )
+    return response['message']['content']
 
 
-# ---------------- VECTOR STORE ---------------- #
+def extract_text(filepath):
+    filename = filepath.lower()
+    text = ''
+
+    if filename.endswith('.pdf'):
+        with open(filepath,'rb') as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + '\n'
+        if not text.strip():
+            images = convert_from_path(filepath)
+            for img in images:
+                text += pytesseract.image_to_string(img)
+
+    elif filename.endswith('.docx'):
+        doc = docx.Document(filepath)
+        for para in doc.paragraphs:
+            text += para.text + '\n'
+
+    elif filename.endswith('.txt'):
+        with open(filepath,'r',encoding='utf-8',errors='ignore') as f:
+            text = f.read()
+
+    elif filename.endswith(('.png','.jpg','.jpeg')):
+        img = Image.open(filepath)
+        text = pytesseract.image_to_string(img)
+
+    elif filename.endswith('.csv'):
+        df = pd.read_csv(filepath)
+        text = df.to_string(index=False)
+
+    elif filename.endswith(('.xlsx','.xls')):
+        sheets = pd.read_excel(filepath, sheet_name=None)
+        for name, df in sheets.items():
+            text += f'\nSheet: {name}\n'
+            text += df.to_string(index=False)
+
+    return text
+
 
 def create_vectorstore(text):
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=100
-    )
-
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
     chunks = splitter.split_text(text)
 
-    vectorstore = FAISS.from_texts(
-        chunks,
-        embedding
-    )
+    if os.path.exists(VECTOR_PATH):
+        shutil.rmtree(VECTOR_PATH)
 
-    os.makedirs("vectorstore", exist_ok=True)
-
-    vectorstore.save_local("vectorstore")
-
-    return vectorstore
+    db = FAISS.from_texts(chunks, embedding)
+    db.save_local(VECTOR_PATH)
 
 
 def load_vectorstore():
+    return FAISS.load_local(VECTOR_PATH, embedding, allow_dangerous_deserialization=True)
 
-    return FAISS.load_local(
-        "vectorstore",
-        embedding,
-        allow_dangerous_deserialization=True
-    )
-
-
-# ---------------- SUMMARY ---------------- #
 
 def summarize_document():
+    db = load_vectorstore()
+    docs = db.similarity_search('main summary', k=5)
+    context = '\n\n'.join([d.page_content for d in docs])
 
-    vectorstore = load_vectorstore()
+    prompt = f'''Summarize this document in 6 clear bullet points.\n\n{context}'''
+    return generate_text(prompt)
 
-    docs = vectorstore.similarity_search("main topic", k=5)
-
-    context = "\n\n".join([doc.page_content for doc in docs])
-
-    prompt = f"""
-Summarize the following document clearly in 5-6 sentences.
-
-Document:
-{context}
-"""
-
-    result = generator(prompt, max_new_tokens=200)
-
-    return result[0]["generated_text"]
-
-
-# ---------------- MCQ GENERATOR ---------------- #
 
 def generate_mcqs():
+    db = load_vectorstore()
+    docs = db.similarity_search('important concepts', k=5)
+    context = '\n\n'.join([d.page_content for d in docs])
 
-    vectorstore = load_vectorstore()
+    prompt = f'''Create 5 MCQs from the text below. Each must have 4 options and 1 correct answer.\n\n{context}'''
+    return generate_text(prompt)
 
-    docs = vectorstore.similarity_search("important concepts", k=5)
-
-    context = "\n\n".join([doc.page_content for doc in docs])
-
-    prompt = f"""
-You are a teacher creating quiz questions.
-
-Create EXACTLY 5 MCQs from the text.
-
-Rules:
-- Each question must have 4 options
-- Only one correct answer
-- Questions should test understanding
-
-Format EXACTLY like this:
-
-Q1: Question
-A. Option
-B. Option
-C. Option
-D. Option
-Answer: A
-
-Q2: Question
-A. Option
-B. Option
-C. Option
-D. Option
-Answer: B
-
-Text:
-{context}
-"""
-
-    result = generator(prompt, max_new_tokens=400)
-
-    return result[0]["generated_text"]
-
-
-# ---------------- QUESTION ANSWERING ---------------- #
 
 def answer_question(question):
+    db = load_vectorstore()
+    docs = db.similarity_search(question, k=8)
+    context = '\n\n'.join([d.page_content for d in docs])
 
-    vectorstore = load_vectorstore()
-
-    docs = vectorstore.similarity_search(question, k=4)
-
-    context = "\n\n".join([doc.page_content for doc in docs])
-
-    prompt = f"""
-Answer the question using the context below.
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer clearly:
-"""
-
-    result = generator(prompt, max_new_tokens=200)
-
-    return result[0]["generated_text"]
+    prompt = f'''Use only the context below to answer clearly. If not found, say information not available.\n\nContext:\n{context}\n\nQuestion: {question}'''
+    return generate_text(prompt)
